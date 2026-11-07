@@ -2,8 +2,8 @@
 
 **Menaquinone (MK) pathway profiling and phylogeny for prokaryotic genomes.**
 
-MenaTree detects the two known menaquinone biosynthesis routes in prokaryotic genomes -the
-classical *men* pathway and the alternative futalosine (*mqn*) pathway- and builds marker-based
+MenaTree detects the two known menaquinone biosynthesis routes in prokaryotic genomes (the
+classical *men* pathway and the alternative futalosine (*mqn*) pathway) and builds marker-based
 supermatrix trees with [EasyCGTree](https://github.com/zdf1987/EasyCGTree4). It is intended as a
 genomic proxy for the chemotaxonomic potential of a strain when respiratory quinones have not been
 measured experimentally.
