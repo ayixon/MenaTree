@@ -44,8 +44,8 @@ Put one FASTA file per genome in a folder:
 
 ```
 genomes/
-├── GCA_000786195.1_ASM78619v1.fna.gz
-├── GCA_001482365.1_genomic.fna
+├── GCA_000797101.1_ASM78619v1.fna.gz
+├── GCA_001522255.1_genomic.fna
 ├── my_isolate.fasta
 └── ...
 ```
@@ -53,7 +53,7 @@ genomes/
 - Nucleotide assemblies (contigs or complete genomes) or proteomes; MenaTree detects the type.
 - Accepted extensions: `.fa .fna .fasta .fas .faa .ffn .fsa .fn .seq`, optionally gzipped.
 - At least **5 genomes** are needed to build a tree (the profile works with any number).
-- Genome IDs are taken from the file names (`GCA_000786195.1_...` → `GCA-000786195`).
+- Genome IDs are taken from the file names (`GCA_000797101.1_...` → `GCA-001522255.1`).
 
 ---
 
