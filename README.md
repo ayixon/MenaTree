@@ -2,8 +2,8 @@
 
 **Menaquinone (MK) pathway profiling and phylogeny for prokaryotic genomes.**
 
-MenaTree detects the two known menaquinone biosynthesis routes in prokaryotic genomes — the
-classical *men* pathway and the alternative futalosine (*mqn*) pathway — and builds marker-based
+MenaTree detects the two known menaquinone biosynthesis routes in prokaryotic genomes -the
+classical *men* pathway and the alternative futalosine (*mqn*) pathway- and builds marker-based
 supermatrix trees with [EasyCGTree](https://github.com/zdf1987/EasyCGTree4). It is intended as a
 genomic proxy for the chemotaxonomic potential of a strain when respiratory quinones have not been
 measured experimentally.
@@ -25,7 +25,7 @@ apptainer run menatree.sif --list-markers
 
 See **[MANUAL.md](MANUAL.md)** for step-by-step examples and how to read the results.
 
-Input: one FASTA file per genome in a directory — nucleotide assemblies (proteins are predicted with
+Input: one FASTA file per genome in a directory -nucleotide assemblies (proteins are predicted with
 Prodigal) or proteomes; `.gz` files are accepted. Extensions: `.fa .fna .fasta .fas .faa .ffn .fsa .fn .seq`.
 At least 5 genomes are needed to build a tree.
 
@@ -50,7 +50,7 @@ At least 5 genomes are needed to build a tree.
 
 ## Marker sets
 
-**`mk` — MKv03, classical pathway (7 markers)**
+**`mk` -MKv03, classical pathway (7 markers)**
 
 | Marker | Model | Enzyme | EC |
 |---|---|---|---|
@@ -62,7 +62,7 @@ At least 5 genomes are needed to build a tree.
 | MenA | TIGR00751 | DHNA octaprenyltransferase | 2.5.1.74 |
 | MenG | Pfam PF01209 | demethylmenaquinone methyltransferase (UbiE/MenG) | 2.1.1.163 |
 
-**`futalosine` — futalosinHMM, futalosine pathway (5 markers)**
+**`futalosine` -futalosinHMM, futalosine pathway (5 markers)**
 
 | Marker | Model | Enzyme | EC |
 |---|---|---|---|
