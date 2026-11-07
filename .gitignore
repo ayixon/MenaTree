@@ -1,0 +1,17 @@
+# Images and run outputs
+*.sif
+menatree_out/
+results/
+*_out/
+
+# Development and test data
+dev/
+
+# Python / OS
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+desktop.ini
+ncbi_dataset/
+*.bak

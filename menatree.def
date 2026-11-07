@@ -1,0 +1,70 @@
+Bootstrap: docker
+From: debian:12-slim
+
+%labels
+    Name MenaTree
+    Version 0.1.1
+    Description Menaquinone (MK) pathway profiling and phylogeny for prokaryotic genomes
+    Author Ayixon Sanchez-Reyes (Instituto de Biotecnologia, UNAM)
+    EasyCGTree_commit 71da49969656371a26e686e97db2736c8caec214
+
+%help
+    MenaTree: menaquinone (MK) pathway profiling and phylogeny for prokaryotic genomes.
+
+    Usage:
+      apptainer run menatree.sif -i genomes/ -o results/ [-m mk|futalosine|auto|custom.hmm] [-t 8]
+      apptainer run menatree.sif --help
+      apptainer run menatree.sif --list-markers
+
+%files
+    menatree /opt/menatree/menatree
+    models /opt/menatree/models
+    README.md /opt/menatree/README.md
+    MANUAL.md /opt/menatree/MANUAL.md
+    LICENSE /opt/menatree/LICENSE
+    NOTICE /opt/menatree/NOTICE
+    CITATION.cff /opt/menatree/CITATION.cff
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends perl python3 libgomp1 libstdc++6 ca-certificates procps curl unzip
+    # EasyCGTree v4.2 (Linux build, distributed as a zip in the repository) with its bundled binaries:
+    # Prodigal 2.6.3, HMMER 3.0, MUSCLE 5.1, trimAl, FastTree 2, ASTRAL (IQ-TREE replaced below)
+    mkdir -p /opt/EasyCGTree4
+    cd /tmp
+    curl -sSL -o ecg.zip https://raw.githubusercontent.com/zdf1987/EasyCGTree4/71da49969656371a26e686e97db2736c8caec214/EasyCGTree.v4.2-Linux.zip
+    echo "f87ac8643b26a50195331e43267c821c40d47d34db895b3c16acf8a3d0393d5f  ecg.zip" | sha256sum -c -
+    unzip -q ecg.zip -d /opt/EasyCGTree4
+    rm -f ecg.zip
+    chmod 755 /opt/EasyCGTree4/EasyCGTree.v4.2-Linux/bin/*
+    # Replace the bundled IQ-TREE 2.2.0, which fails on some small supermatrices
+    # ("Alignment sequence ... does not appear in the tree"), with IQ-TREE 2.3.6.
+    curl -sSL -o iqtree.tgz https://github.com/iqtree/iqtree2/releases/download/v2.3.6/iqtree-2.3.6-Linux-intel.tar.gz
+    echo "47389ea3b32c5fb61fba1a2b65c0ea057467d71f39a51fc4c4624927f200786d  iqtree.tgz" | sha256sum -c -
+    tar xzf iqtree.tgz
+    mv /opt/EasyCGTree4/EasyCGTree.v4.2-Linux/bin/iqtree2 /opt/EasyCGTree4/EasyCGTree.v4.2-Linux/bin/iqtree2-2.2.0
+    install -m 755 iqtree-2.3.6-Linux-intel/bin/iqtree2 /opt/EasyCGTree4/EasyCGTree.v4.2-Linux/bin/iqtree2
+    rm -rf iqtree.tgz iqtree-2.3.6-Linux-intel
+    ln -s /opt/EasyCGTree4/EasyCGTree.v4.2-Linux /opt/menatree/EasyCGTree
+    chmod 755 /opt/menatree/menatree
+    ln -s /opt/menatree/menatree /usr/local/bin/menatree
+    apt-get purge -y curl unzip
+    apt-get autoremove -y
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+
+%environment
+    export LC_ALL=C.UTF-8
+    export MENATREE_ECG=/opt/menatree/EasyCGTree
+    export MENATREE_MODELS=/opt/menatree/models
+
+%runscript
+    exec python3 /opt/menatree/menatree "$@"
+
+%test
+    python3 /opt/menatree/menatree --version
+    python3 /opt/menatree/menatree --list-markers
+    /opt/menatree/EasyCGTree/bin/hmmsearch -h | head -2
+    /opt/menatree/EasyCGTree/bin/prodigal -v

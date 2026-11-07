@@ -1,0 +1,5 @@
+# Keep HMM files byte-identical (no line-ending conversion)
+*.hmm -text
+# Scripts must keep LF endings to run on Linux
+menatree text eol=lf
+*.def text eol=lf

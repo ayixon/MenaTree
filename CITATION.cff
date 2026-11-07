@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use MenaTree, please cite it as below, together with the tools listed in CITATIONS.txt."
+title: "MenaTree: menaquinone pathway profiling and phylogeny for prokaryotic genomes"
+type: software
+version: 0.1.1
+date-released: 2026-11-07
+license: GPL-3.0-only
+repository-code: "https://github.com/ayixon/MenaTree"
+authors:
+  - family-names: "Sánchez-Reyes"
+    given-names: "Ayixon"
+    affiliation: "Instituto de Biotecnología, Universidad Nacional Autónoma de México"
+keywords:
+  - menaquinone
+  - chemotaxonomy
+  - futalosine pathway
+  - phylogenomics
+  - prokaryotes
+references:
+  - type: article
+    title: "EasyCGTree: a pipeline for prokaryotic phylogenomic analysis based on core gene sets"
+    authors:
+      - family-names: "Zhang"
+        given-names: "Dao-Feng"
+      - family-names: "He"
+        given-names: "Wei"
+      - family-names: "Shao"
+        given-names: "Zongze"
+      - family-names: "Ahmed"
+        given-names: "Iftikhar"
+      - family-names: "Zhang"
+        given-names: "Yuqin"
+      - family-names: "Li"
+        given-names: "Wen-Jun"
+      - family-names: "Zhao"
+        given-names: "Zhe"
+    journal: "BMC Bioinformatics"
+    year: 2023
+    doi: "10.1186/s12859-023-05527-2"

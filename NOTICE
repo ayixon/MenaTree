@@ -1,0 +1,35 @@
+MenaTree
+Copyright (C) 2026 Ayixon Sanchez-Reyes, Instituto de Biotecnologia, UNAM
+
+MenaTree is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License as published by the Free Software Foundation, version 3 (see LICENSE).
+
+ADDITIONAL TERMS (GNU GPL v3, section 7(b))
+
+As permitted by section 7(b) of the GNU GPL v3, the following additional terms apply to MenaTree
+and to any work based on it:
+
+1. Attribution. Any copy, modified version or derivative work of MenaTree must preserve this
+   NOTICE file, the CITATION.cff file and the citation request printed by the program and written
+   to CITATIONS.txt, and must keep the name "MenaTree" and its author attribution in the user
+   documentation and in the program's help and log output.
+
+2. Citation request. Users who publish results obtained with MenaTree, or with a work based on it,
+   are requested to cite MenaTree as indicated in CITATION.cff, together with the third-party tools
+   and marker databases listed in CITATIONS.txt.
+
+THIRD-PARTY COMPONENTS (not distributed in this repository)
+
+The Apptainer image built from menatree.def downloads and includes:
+  - EasyCGTree v4.2 (Zhang D-F et al., 2023; https://github.com/zdf1987/EasyCGTree4), with its
+    bundled Prodigal, HMMER 3.0, MUSCLE 5, trimAl, FastTree 2 and ASTRAL binaries. At the time of
+    writing, the EasyCGTree4 repository does not declare a license; obtain the author's permission
+    before redistributing a built image.
+  - IQ-TREE 2.3.6 (GPL-2.0), https://github.com/iqtree/iqtree2
+
+Marker models in models/ are derived from:
+  - HAMAP (CC BY 4.0): MF_01935, MF_00470, MF_00995, MF_00993, MF_00991, MF_00992, MF_00996
+  - NCBIFAM / TIGRFAMs: TIGR00173, TIGR00751, NF005877, NF005637
+  - Pfam: PF01209
+Their model parameters are unchanged; only header lines (format tag, NAME, ACC, DESC, cut-off,
+BM and SM lines) were edited. See models/README.md.

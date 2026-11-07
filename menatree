@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""MenaTree: menaquinone (MK) pathway profiling and phylogeny for prokaryotic genomes.
+
+Copyright (C) 2026 Ayixon Sanchez-Reyes, Instituto de Biotecnologia, UNAM.
+Licensed under the GNU General Public License v3.0 with additional attribution terms
+(GPL-3.0, section 7(b)); see LICENSE and NOTICE.
+
+Profiles the classical (men) and futalosine (mqn) menaquinone biosynthesis pathways
+in each genome and infers marker-based supermatrix trees with EasyCGTree.
+"""
+import argparse
+import concurrent.futures as cf
+import datetime
+import glob
+import gzip
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+VERSION = "0.1.1"
+HOME = os.path.dirname(os.path.realpath(__file__))
+MODELS_DIR = os.environ.get("MENATREE_MODELS", os.path.join(HOME, "models"))
+ECG_DIR = os.environ.get("MENATREE_ECG", os.path.join(HOME, "EasyCGTree"))
+BIN = os.path.join(ECG_DIR, "bin")
+
+BUILTIN = {
+    "mk": ("MKv03", "Classical menaquinone pathway (men genes)"),
+    "futalosine": ("futalosinHMM", "Futalosine pathway (mqn genes)"),
+}
+# Markers used to call each pathway. MenG (shared with ubiquinone/futalosine routes)
+# and MqnB (cross-hits MtnN nucleosidases) are profiled but not used for the call.
+CLASSICAL_CALL = ["MenF", "MenD", "MenC", "MenE", "MenB", "MenA"]
+# MenF, MenC, MenE and MenB belong to large families (chorismate-utilising enzymes, enolases,
+# acyl-CoA ligases, crotonases) and also hit paralogs in futalosine-pathway genomes such as
+# Streptomyces. MenD and MenA are pathway-specific and are therefore required.
+CLASSICAL_REQUIRED = ["MenD", "MenA"]
+FUTALOSINE_CALL = ["MqnA", "MqnE", "MqnC", "MqnD"]
+MIN_CLASSICAL = 4
+MIN_FUTALOSINE = 3
+MIN_TREE_GENOMES = 5  # EasyCGTree requires >= 5 input files
+
+EXTS = (".fa", ".fna", ".fasta", ".fas", ".faa", ".ffn", ".fsa", ".fn", ".seq")
+LOG = None
+
+
+def log(msg, quiet=False):
+    line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
+    if not quiet:
+        print(line, flush=True)
+    if LOG:
+        LOG.write(line + "\n")
+        LOG.flush()
+
+
+def die(msg):
+    log("ERROR: " + msg)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------- inputs
+def open_text(path):
+    return gzip.open(path, "rt") if path.endswith(".gz") else open(path)
+
+
+def list_inputs(indir):
+    files = []
+    for f in sorted(os.listdir(indir)):
+        p = os.path.join(indir, f)
+        base = f[:-3] if f.endswith(".gz") else f
+        if os.path.isfile(p) and base.lower().endswith(EXTS):
+            files.append(p)
+    return files
+
+
+def make_id(path, used):
+    base = os.path.basename(path)
+    if base.endswith(".gz"):
+        base = base[:-3]
+    base = os.path.splitext(base)[0]
+    m = re.match(r"(GC[AF])[_-](\d{9})(?:\.\d+)?", base)
+    gid = f"{m.group(1)}-{m.group(2)}" if m else re.sub(r"[^A-Za-z0-9-]+", "-", base).strip("-")
+    gid = gid or "genome"
+    cand, k = gid, 2
+    while cand in used:
+        cand = f"{gid}-{k}"
+        k += 1
+    used.add(cand)
+    return cand
+
+
+def sniff(path):
+    """Return (seqtype, first_header, total_length_estimate)."""
+    header, seq, n = None, [], 0
+    with open_text(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                if header is None:
+                    header = line[1:]
+                continue
+            seq.append(line)
+            n += len(line)
+            if n > 20000:
+                break
+    s = "".join(seq).upper()
+    if not s:
+        return None, header, 0
+    nuc = sum(s.count(c) for c in "ACGTN") / len(s)
+    return ("nucl" if nuc >= 0.9 else "prot"), header, n
+
+
+CUT_WORDS = [",", " chromosome", " complete", " genome", " whole", " contig", " scaffold",
+             " Scaffold", " DNA", " NODE_", " plasmid", " genomic", " Ga0", " tig0", " platanus",
+             " sequence", " map unlocalized", " unplaced"]
+
+
+def label_from_header(gid, header):
+    """'GCA-000786195 Kocuria rosea CMS 76or' from an NCBI-style FASTA header."""
+    if not header:
+        return gid
+    toks = header.split(None, 1)
+    if len(toks) < 2:
+        return gid
+    desc = toks[1]
+    cut = len(desc)
+    for w in CUT_WORDS:
+        i = desc.find(w)
+        if 0 < i < cut:
+            cut = i
+    desc = desc[:cut]
+    desc = re.sub(r"\bsubsp\.\s+\S+\s*", "", desc)
+    desc = re.sub(r"\bstrain\s+", "", desc)
+    desc = re.sub(r"\s+", " ", desc).strip()
+    w = desc.split()
+    # drop a trailing contig number glued to a strain name ('sp. M1R5S2 26')
+    if len(w) >= 4 and w[-1].isdigit() and re.search(r"\d", w[-2]) and re.search(r"[A-Za-z]", w[-2]):
+        w = w[:-1]
+        desc = " ".join(w)
+    if len(w) < 2 or not w[0][:1].isupper() or not (w[1][:1].islower() or w[1] == "sp."):
+        return gid  # header does not look like 'Genus species ...'
+    return f"{gid} {desc}"
+
+
+def read_labels_file(path):
+    d = {}
+    with open(path) as fh:
+        for line in fh:
+            if line.strip() and not line.startswith("#"):
+                k, v = line.rstrip("\n").split("\t", 1)
+                d[k.strip()] = v.strip()
+    return d
+
+
+def prepare_genome(args_t):
+    path, gid, outdir = args_t
+    stype, header, n = sniff(path)
+    out = os.path.join(outdir, gid + ".fas")
+    if stype is None:
+        return gid, None, header, 0, "no sequence found"
+    if stype == "prot":
+        with open_text(path) as fi, open(out, "w") as fo:
+            shutil.copyfileobj(fi, fo)
+    else:
+        src = path
+        tmp = None
+        if path.endswith(".gz"):
+            tmp = out + ".fna"
+            with gzip.open(path, "rt") as fi, open(tmp, "w") as fo:
+                shutil.copyfileobj(fi, fo)
+            src = tmp
+        mode = ["-p", "meta"] if n < 20000 else []
+        r = subprocess.run([os.path.join(BIN, "prodigal"), "-i", src, "-a", out, "-o", os.devnull,
+                            "-m", "-q"] + mode, capture_output=True, text=True)
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        if r.returncode != 0 or not os.path.exists(out):
+            return gid, None, header, 0, "Prodigal failed: " + r.stderr.strip()[:200]
+    nprot = sum(1 for l in open(out) if l.startswith(">"))
+    return gid, stype, header, nprot, None
+
+
+# ---------------------------------------------------------------- HMMs
+def read_hmm_info(path):
+    info = []
+    with open(path) as fh:
+        name = acc = None
+        for line in fh:
+            if line.startswith("NAME"):
+                name, acc = line.split()[1], None
+            elif line.startswith("ACC"):
+                acc = line.split()[1]
+            elif line.startswith("LENG"):
+                info.append({"name": name, "acc": acc or name, "leng": int(line.split()[1])})
+    return info
+
+
+def install_hmm(src, dst_dir, setname, for_ecg=False):
+    """Copy an HMM file for HMMER 3.0 ('HMMER3/b' format tag). For EasyCGTree, underscores in
+    NAME/ACC are replaced by '-' because EasyCGTree splits sequence headers on '_'."""
+    dst = os.path.join(dst_dir, setname + ".hmm")
+    n = 0
+    with open(src) as fi, open(dst, "w", newline="") as fo:
+        for line in fi:
+            if re.match(r"HMMER3/[c-f]", line):
+                line, n = "HMMER3/b [3.0 | March 2010]\n", n + 1
+            elif for_ecg and line[:4] in ("NAME", "ACC "):
+                line = line[:6] + line[6:].replace("_", "-")
+            fo.write(line)
+    if n:
+        log(f"  {n} model header(s) in {os.path.basename(src)} relabelled to HMMER3/b for HMMER 3.0.")
+    return dst
+
+
+def run_hmmsearch(args_t):
+    hmm, prot, tbl, evalue = args_t
+    r = subprocess.run([os.path.join(BIN, "hmmsearch"), "--cpu", "1", "-E", str(evalue),
+                        "--tblout", tbl, "-o", os.devnull, hmm, prot], capture_output=True, text=True)
+    return r.returncode, r.stderr
+
+
+def parse_tbl(tbl):
+    hits = []
+    for line in open(tbl):
+        if line.startswith("#"):
+            continue
+        x = line.split()
+        hits.append((x[0], x[2], float(x[4]), float(x[5])))  # target, query, evalue, bits
+    return hits
+
+
+# ---------------------------------------------------------------- trees
+def quote(s):
+    return "'" + s.replace("'", "") + "'" if re.search(r"[\s(),:;\[\]']", s) else s
+
+
+def relabel_tree(newick, labels, underscore=False):
+    def rep(m):
+        tip = m.group(2)
+        lab = labels.get(tip, tip)
+        lab = re.sub(r"\s+", "_", lab) if underscore else quote(lab)
+        return m.group(1) + lab + m.group(3)
+    return re.sub(r"([(,])([^():,;']+)(:)", rep, newick)
+
+
+def fasta_stats(path):
+    n, length, cur = 0, 0, 0
+    for line in open(path):
+        if line.startswith(">"):
+            if n == 1:
+                length = cur
+            n += 1
+            cur = 0
+        else:
+            cur += len(line.strip())
+    if n == 1:
+        length = cur
+    return n, length
+
+
+def run_easycgtree(setname, hmm_src, gids, protdir, outdir, tmpdir, a, acc2name):
+    rdir = os.path.join(tmpdir, "run_" + setname)
+    if os.path.exists(rdir):
+        shutil.rmtree(rdir)
+    os.makedirs(os.path.join(rdir, "genomes"))
+    os.makedirs(os.path.join(rdir, "HMM"))
+    try:
+        os.symlink(BIN, os.path.join(rdir, "bin"))
+    except OSError:  # filesystems without symlink support
+        shutil.copytree(BIN, os.path.join(rdir, "bin"))
+    install_hmm(hmm_src, os.path.join(rdir, "HMM"), setname, for_ecg=True)
+    for g in gids:
+        shutil.copy(os.path.join(protdir, g + ".fas"), os.path.join(rdir, "genomes", g + ".fas"))
+    cmd = ["perl", os.path.join(ECG_DIR, "EasyCGTree.pl"), "-input", "genomes", "-hmm", setname,
+           "-task", "all", "-tree", "sm", "-tree_app", a.tree_app, "-trim", a.trim,
+           "-thread", str(a.threads), "-evalue", str(a.evalue),
+           "-gene_cutoff", str(a.gene_cutoff), "-genome_cutoff", str(a.genome_cutoff)]
+    log(f"  Running EasyCGTree ({setname}, {len(gids)} genomes, {a.tree_app}) ...")
+    with open(os.path.join(rdir, "easycgtree.stdout"), "w") as fo:
+        r = subprocess.run(cmd, cwd=rdir, stdout=fo, stderr=subprocess.STDOUT)
+    sdir = os.path.join(outdir, setname)
+    os.makedirs(sdir, exist_ok=True)
+    ecg_log = sorted(glob.glob(os.path.join(rdir, f"genomes.{setname}.*.log")))
+    if ecg_log:
+        shutil.copy(ecg_log[-1], os.path.join(sdir, "easycgtree.log"))
+    trees = [t for t in glob.glob(os.path.join(rdir, f"genomes.{setname}.*.supermatrix.{a.tree_app}.tree"))
+             if os.path.getsize(t) > 0 and "(" in open(t).read()]
+    if trees and r.returncode != 0:
+        # EasyCGTree 4.2 exits with an error after IQ-TREE runs (it looks for the IQ-TREE log in the
+        # wrong folder) although the tree has already been written.
+        log(f"  Note: EasyCGTree exited with code {r.returncode} after writing the tree; tree kept.", quiet=True)
+    if not trees:
+        shutil.copy(os.path.join(rdir, "easycgtree.stdout"), os.path.join(sdir, "easycgtree.stdout"))
+        log(f"  WARNING: EasyCGTree did not produce a tree for {setname}; see {sdir}/easycgtree.stdout")
+        return None
+    newick = open(trees[0]).read().strip()
+    tem = os.path.join(rdir, "genomes_TEM")
+    conc = glob.glob(os.path.join(tem, f"genomes.{setname}.*.concatenation.fas"))
+    if conc:
+        shutil.copy(conc[0], os.path.join(sdir, "supermatrix.faa"))
+    # markers used
+    rows = []
+    for aln in sorted(glob.glob(os.path.join(tem, "TEM6_AlnTrimmed", "*.fasta"))):
+        acc = os.path.basename(aln)[: -len(".fasta")]
+        raw = os.path.join(tem, "TEM5_Alignment", acc + ".fas.fasta")
+        n_raw, l_raw = fasta_stats(raw) if os.path.exists(raw) else (0, 0)
+        n_trim, l_trim = fasta_stats(aln)
+        name = acc2name.get(acc, acc)
+        acc = next((k for k, v in acc2name.items() if v == name and "_" in k), acc)
+        rows.append((name, acc, n_trim, l_raw, l_trim,
+                     f"{100 * l_trim / l_raw:.1f}" if l_raw else "NA"))
+    with open(os.path.join(sdir, "markers_used.tsv"), "w") as fo:
+        fo.write("marker\taccession\tgenomes\taligned_columns\ttrimmed_columns\tpct_retained\n")
+        for row in rows:
+            fo.write("\t".join(map(str, row)) + "\n")
+    total = sum(r_[4] for r_ in rows)
+    open(os.path.join(sdir, f"menatree.{setname}.tree"), "w").write(newick + "\n")
+    tips = set(re.findall(r"[(,]([^():,;']+):", newick))
+    dropped = [g for g in gids if g not in tips]
+    log(f"  {setname}: {len(rows)} markers, {total} aligned aa, {len(tips)} genomes in tree"
+        + (f"; dropped by EasyCGTree filters: {', '.join(dropped)}" if dropped else ""))
+    return newick, len(rows), total, len(tips)
+
+
+# ---------------------------------------------------------------- main
+def main():
+    global LOG, BIN, ECG_DIR
+    p = argparse.ArgumentParser(
+        prog="menatree",
+        description="MenaTree: menaquinone (MK) pathway profiling and phylogeny for prokaryotic genomes.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Marker sets:\n  mk          MKv03, classical pathway: MenF MenD MenC MenE MenB MenA MenG (default)\n"
+               "  futalosine  futalosinHMM, futalosine pathway: MqnA MqnE MqnB MqnC MqnD\n"
+               "  auto        profile all genomes, then build one tree per pathway group\n"
+               "  FILE.hmm    any custom HMMER3 profile set\n\n"
+               "Example:\n  menatree -i genomes/ -o results/ -m auto -t 8")
+    p.add_argument("-i", "--input", required=False, help="Directory of genome (nucleotide) or proteome FASTA files (.gz accepted)")
+    p.add_argument("-o", "--outdir", default="menatree_out", help="Output directory (default: menatree_out)")
+    p.add_argument("-m", "--markers", default="mk", help="mk (default) | futalosine | auto | path/to/custom.hmm")
+    p.add_argument("-t", "--threads", type=int, default=4, help="CPU threads (default: 4)")
+    p.add_argument("--tree-app", choices=["fasttree", "iqtree"], default="fasttree", help="Tree inference program (default: fasttree)")
+    p.add_argument("--trim", choices=["strict", "gappyout", "strictplus"], default="strict", help="trimAl mode (default: strict)")
+    p.add_argument("--evalue", type=float, default=1e-10, help="hmmsearch E-value threshold (default: 1e-10)")
+    p.add_argument("--gene-cutoff", type=float, default=0.8, help="Min. fraction of genomes carrying a marker (default: 0.8)")
+    p.add_argument("--genome-cutoff", type=float, default=0.8, help="Min. fraction of markers per genome (default: 0.8)")
+    p.add_argument("--profile-only", action="store_true", help="Report pathway profiles without building trees")
+    p.add_argument("--labels", help="Tab-separated file 'genome_id<TAB>label' to name tree tips")
+    p.add_argument("--no-header-labels", action="store_true", help="Do not derive tip labels from FASTA headers")
+    p.add_argument("--keep-tmp", action="store_true", help="Keep intermediate EasyCGTree files")
+    p.add_argument("--list-markers", action="store_true", help="Show built-in marker sets and exit")
+    p.add_argument("-v", "--version", action="version", version=f"MenaTree {VERSION}")
+    a = p.parse_args()
+
+    if a.list_markers:
+        for key, (setname, desc) in BUILTIN.items():
+            info = read_hmm_info(os.path.join(MODELS_DIR, setname + ".hmm"))
+            print(f"{key:<11} {setname:<13} {desc}")
+            for m in info:
+                print(f"{'':<25}{m['name']:<7}{m['acc']:<13}{m['leng']} aa")
+        return
+    if not a.input:
+        p.error("the following argument is required: -i/--input")
+    if not os.path.isdir(a.input):
+        p.error(f"input directory not found: {a.input}")
+    for f in ("prodigal", "hmmsearch"):
+        if not os.path.exists(os.path.join(BIN, f)):
+            p.error(f"EasyCGTree binaries not found in {BIN} (set MENATREE_ECG)")
+
+    mode = a.markers
+    custom = None
+    if mode not in ("mk", "futalosine", "auto"):
+        if not os.path.isfile(mode):
+            p.error(f"-m must be mk, futalosine, auto or an existing .hmm file (got '{mode}')")
+        custom = os.path.abspath(mode)
+
+    outdir = os.path.abspath(a.outdir)
+    os.makedirs(outdir, exist_ok=True)
+    LOG = open(os.path.join(outdir, "menatree.log"), "w")
+    log(f"MenaTree {VERSION} | mode={mode} | input={os.path.abspath(a.input)} | outdir={outdir}")
+    log("Command: " + " ".join(sys.argv))
+    ncpu = os.cpu_count() or 1
+    if a.threads > ncpu:
+        log(f"  {a.threads} threads requested but only {ncpu} CPU cores available; using {ncpu}.")
+        a.threads = ncpu
+
+    # 1. inputs -> proteomes
+    files = list_inputs(a.input)
+    if not files:
+        die(f"no FASTA files ({', '.join(EXTS)}) found in {a.input}")
+    protdir = os.path.join(outdir, "proteomes")
+    os.makedirs(protdir, exist_ok=True)
+    used = set()
+    jobs = [(f, make_id(f, used), protdir) for f in files]
+    orig = {gid: os.path.basename(f) for f, gid, _ in jobs}
+    log(f"Step 1/4: preparing proteomes for {len(jobs)} genomes (Prodigal for nucleotide input)")
+    meta = {}
+    with cf.ThreadPoolExecutor(a.threads) as ex:
+        for gid, stype, header, nprot, err in ex.map(prepare_genome, jobs):
+            if err:
+                log(f"  WARNING: {orig[gid]} skipped: {err}")
+                continue
+            meta[gid] = {"type": stype, "header": header, "nprot": nprot}
+    if not meta:
+        die("no usable genomes")
+    user_labels = read_labels_file(a.labels) if a.labels else {}
+    labels = {}
+    for gid, m in meta.items():
+        if gid in user_labels:
+            labels[gid] = user_labels[gid]
+        elif not a.no_header_labels and m["type"] == "nucl":
+            labels[gid] = label_from_header(gid, m["header"])
+        else:
+            labels[gid] = gid
+    gids = sorted(meta)
+
+    # 2. pathway profile
+    log("Step 2/4: profiling menaquinone pathway markers")
+    tmpdir = os.path.join(outdir, "tmp")
+    os.makedirs(tmpdir, exist_ok=True)
+    sets = {k: os.path.join(MODELS_DIR, v[0] + ".hmm") for k, v in BUILTIN.items()}
+    if custom:
+        sets["custom"] = custom
+    profile_hmm = os.path.join(tmpdir, "profile.hmm")
+    markers = []
+    with open(profile_hmm, "w") as fo:
+        for k, path in sets.items():
+            info = read_hmm_info(path)
+            for m in info:
+                m["set"] = k
+            markers += info
+            tmp = install_hmm(path, tmpdir, "profile_" + k)
+            fo.write(open(tmp).read())
+    tbldir = os.path.join(tmpdir, "tbl")
+    os.makedirs(tbldir, exist_ok=True)
+    hjobs = [(profile_hmm, os.path.join(protdir, g + ".fas"), os.path.join(tbldir, g + ".tbl"), a.evalue) for g in gids]
+    with cf.ThreadPoolExecutor(a.threads) as ex:
+        for (rc, err), g in zip(ex.map(run_hmmsearch, hjobs), gids):
+            if rc != 0:
+                die(f"hmmsearch failed on {g}: {err.strip()[:300]}")
+    leng = {m["name"]: m["leng"] for m in markers}
+    acc2name = {}
+    for m in markers:
+        acc2name[m["acc"]] = acc2name[m["acc"].replace("_", "-")] = m["name"]
+    # A marker is present when its best hit passes E-value and bits >= LENG/4 (the EasyCGTree
+    # filter). Copies = passing hits scoring >= 50% of the best hit, so that distant paralogs
+    # of large families (acyl-CoA ligases, crotonases, enolases) are not counted as copies.
+    hits = {g: parse_tbl(os.path.join(tbldir, g + ".tbl")) for g in gids}
+    best, copies = {}, {}
+    for g in gids:
+        for tgt, q, ev, bits in hits[g]:
+            if ev <= a.evalue and bits >= leng[q] / 4:
+                best[(g, q)] = max(best.get((g, q), 0), bits)
+    with open(os.path.join(outdir, "profile_hits.tsv"), "w") as fo:
+        fo.write("genome\tmarker\tprotein\tevalue\tbits\tstatus\n")
+        for g in gids:
+            for tgt, q, ev, bits in sorted(hits[g], key=lambda h: (h[1], -h[3])):
+                if not (ev <= a.evalue and bits >= leng[q] / 4):
+                    st = "below_threshold"
+                elif bits == best[(g, q)]:
+                    st = "best_hit"
+                elif bits >= 0.5 * best[(g, q)]:
+                    st = "copy"
+                else:
+                    st = "paralog"
+                if st in ("best_hit", "copy"):
+                    copies[(g, q)] = copies.get((g, q), 0) + 1
+                fo.write(f"{g}\t{q}\t{tgt}\t{ev:.2g}\t{bits:.1f}\t{st}\n")
+    call = {}
+    names = [m["name"] for m in markers]
+    with open(os.path.join(outdir, "pathway_bits.tsv"), "w") as fo:
+        fo.write("genome\t" + "\t".join(names) + "\n")
+        for g in gids:
+            fo.write(g + "\t" + "\t".join(f"{best.get((g, n), 0):.1f}" for n in names) + "\n")
+    with open(os.path.join(outdir, "pathway_profile.tsv"), "w") as fo:
+        fo.write("genome\tlabel\tinput\tproteins\t" + "\t".join(names)
+                 + "\tclassical_markers\tfutalosine_markers\tpathway\n")
+        for g in gids:
+            nc = sum(1 for n in CLASSICAL_CALL if (g, n) in best)
+            nf = sum(1 for n in FUTALOSINE_CALL if (g, n) in best)
+            c = nc >= MIN_CLASSICAL and all((g, n) in best for n in CLASSICAL_REQUIRED)
+            f_ = nf >= MIN_FUTALOSINE
+            call[g] = "both" if c and f_ else "classical" if c else "futalosine" if f_ else \
+                      "incomplete" if nc or nf else "none"
+            cells = [str(copies.get((g, n), 0)) for n in names]
+            fo.write(f"{g}\t{labels[g]}\t{meta[g]['type']}\t{meta[g]['nprot']}\t" + "\t".join(cells)
+                     + f"\t{nc}/{len(CLASSICAL_CALL)}\t{nf}/{len(FUTALOSINE_CALL)}\t{call[g]}\n")
+    with open(os.path.join(outdir, "genome_labels.tsv"), "w") as fo:
+        fo.write("genome\tinput_file\tlabel\n")
+        for g in gids:
+            fo.write(f"{g}\t{orig[g]}\t{labels[g]}\n")
+    summary = {}
+    for g in gids:
+        summary[call[g]] = summary.get(call[g], 0) + 1
+    log("  Pathway calls: " + ", ".join(f"{k}={v}" for k, v in sorted(summary.items())))
+
+    # 3. trees
+    results = []
+    if a.profile_only:
+        log("Step 3/4: skipped (--profile-only)")
+    else:
+        log("Step 3/4: building marker supermatrix trees")
+        plan = []
+        if mode == "auto":
+            grp_c = [g for g in gids if call[g] in ("classical", "both")]
+            grp_f = [g for g in gids if call[g] in ("futalosine", "both")]
+            plan = [("MKv03", sets["mk"], grp_c, "classical"), ("futalosinHMM", sets["futalosine"], grp_f, "futalosine")]
+            other = [g for g in gids if call[g] in ("none", "incomplete")]
+            if other:
+                log(f"  Not placed in any tree (no complete pathway): {', '.join(other)}")
+        elif mode in BUILTIN:
+            ok = ("classical", "both") if mode == "mk" else ("futalosine", "both")
+            grp = [g for g in gids if call[g] in ok]
+            other = [g for g in gids if g not in grp]
+            if other:
+                log(f"  Excluded from the {mode} tree (pathway not called): {', '.join(other)}")
+            plan = [(BUILTIN[mode][0], sets[mode], grp, mode)]
+        else:
+            setname = re.sub(r"[^A-Za-z0-9-]+", "-", os.path.splitext(os.path.basename(custom))[0])
+            plan = [(setname, custom, gids, "custom")]
+        for setname, hmm, grp, what in plan:
+            if len(grp) < MIN_TREE_GENOMES:
+                log(f"  {what}: {len(grp)} genome(s); at least {MIN_TREE_GENOMES} are needed for a tree - skipped")
+                continue
+            # Anticipate EasyCGTree's filters: genomes must carry >= genome_cutoff of the markers
+            # detected in the dataset; otherwise EasyCGTree stops without a tree.
+            setnames = [m["name"] for m in markers if m["set"] == ("custom" if what == "custom" else
+                        "mk" if setname == "MKv03" else "futalosine")]
+            detected = [n for n in setnames if any((g, n) in best for g in grp)]
+            fit = [g for g in grp if detected and
+                   sum((g, n) in best for n in detected) > a.genome_cutoff * len(detected) - 1e-9]
+            if len(detected) == 0 or len(fit) < MIN_TREE_GENOMES:
+                log(f"  {what}: only {len(fit)} genome(s) carry >= {a.genome_cutoff:.0%} of the {setname} markers "
+                    f"({len(detected)} detected); at least {MIN_TREE_GENOMES} are needed - tree skipped. "
+                    "See pathway_profile.tsv.")
+                continue
+            res = run_easycgtree(setname, hmm, grp, protdir, outdir, tmpdir, a, acc2name)
+            if res:
+                newick = res[0]
+                sdir = os.path.join(outdir, setname)
+                open(os.path.join(sdir, f"menatree.{setname}.labeled.tree"), "w").write(relabel_tree(newick, labels) + "\n")
+                open(os.path.join(sdir, f"menatree.{setname}.labeled_underscore.tree"), "w").write(
+                    relabel_tree(newick, labels, underscore=True) + "\n")
+                results.append((setname,) + res[1:])
+
+    # 4. wrap up
+    log("Step 4/4: writing citations and cleaning up")
+    write_citations(os.path.join(outdir, "CITATIONS.txt"), a.tree_app)
+    if not a.keep_tmp:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    log("If you use MenaTree in published work, please cite it and the tools listed in CITATIONS.txt.")
+    log("Done. Main outputs:")
+    log(f"  {outdir}/pathway_profile.tsv")
+    for setname, nmk, aa, ntips in results:
+        log(f"  {outdir}/{setname}/menatree.{setname}.labeled.tree  ({nmk} markers, {aa} aa, {ntips} genomes)")
+
+
+def write_citations(path, tree_app):
+    txt = f"""If you use MenaTree, please cite the tools and resources it relies on:
+
+MenaTree v{VERSION}: Sanchez-Reyes A. (2026). MenaTree: menaquinone pathway profiling and phylogeny for
+  prokaryotic genomes. https://github.com/ayixon/MenaTree (see CITATION.cff for the current reference).
+EasyCGTree: Zhang D-F, He W, Shao Z, Ahmed I, Zhang Y, Li W-J, Zhao Z (2023). EasyCGTree: a pipeline for
+  prokaryotic phylogenomic analysis based on core gene sets. BMC Bioinformatics. doi:10.1186/s12859-023-05527-2
+Prodigal: Hyatt D, et al. (2010). BMC Bioinformatics 11:119. doi:10.1186/1471-2105-11-119
+HMMER: Eddy SR (2011). Accelerated profile HMM searches. PLoS Comput Biol 7:e1002195. doi:10.1371/journal.pcbi.1002195
+MUSCLE v5: Edgar RC (2022). Nat Commun 13:6968. doi:10.1038/s41467-022-34630-w
+trimAl: Capella-Gutierrez S, et al. (2009). Bioinformatics 25:1972-1973. doi:10.1093/bioinformatics/btp348
+"""
+    txt += ("FastTree 2: Price MN, et al. (2010). PLoS ONE 5:e9490. doi:10.1371/journal.pone.0009490\n"
+            if tree_app == "fasttree" else
+            "IQ-TREE 2: Minh BQ, et al. (2020). Mol Biol Evol 37:1530-1534. doi:10.1093/molbev/msaa015\n")
+    txt += """
+Marker models:
+  HAMAP (MenF MF_01935, MenC MF_00470, MqnA MF_00995, MqnB MF_00991, MqnC MF_00992, MqnD MF_00996,
+    MqnE MF_00993): Pedruzzi I, et al. (2015). Nucleic Acids Res 43:D1064-D1070. doi:10.1093/nar/gku1002
+  NCBIFAM/TIGRFAMs (MenD TIGR00173, MenA TIGR00751, MenE NF005877, MenB NF005637):
+    Haft DH, et al. (2024). Nucleic Acids Res 52:D762-D769. doi:10.1093/nar/gkad988
+  Pfam (MenG/UbiE PF01209): Mistry J, et al. (2021). Nucleic Acids Res 49:D412-D419. doi:10.1093/nar/gkaa913
+"""
+    open(path, "w").write(txt)
+
+
+if __name__ == "__main__":
+    main()
